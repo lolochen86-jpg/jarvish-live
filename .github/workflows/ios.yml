@@ -1,0 +1,77 @@
+name: iOS build and tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['JARVISHLive/**', 'JARVISHLiveTests/**', 'JARVISHLiveUITests/**', 'JARVISHLive.xcodeproj/**', 'scripts/**', '.github/workflows/ios.yml']
+  pull_request:
+    paths: ['JARVISHLive/**', 'JARVISHLiveTests/**', 'JARVISHLiveUITests/**', 'JARVISHLive.xcodeproj/**', 'scripts/**', '.github/workflows/ios.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    # Private repositories require explicit opt-in after checking free allowance/budget.
+    if: github.event.repository.private == false || vars.ALLOW_PRIVATE_ACTIONS == 'true'
+    runs-on: macos-15
+    timeout-minutes: 25
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+      - name: Record environment and validate source
+        run: |
+          set -euo pipefail
+          mkdir -p build/evidence
+          { sw_vers; uname -m; xcodebuild -version; xcodebuild -showsdks; } | tee build/evidence/environment.txt
+          python3 scripts/generate_project.py
+          python3 scripts/validate_project.py
+          xcrun simctl list devices available --json > build/evidence/devices.json
+          python3 scripts/select_simulator.py build/evidence/devices.json "$(xcrun --sdk iphonesimulator --show-sdk-version)" >> "$GITHUB_ENV"
+      - name: Build iPhone architecture without signing
+        run: |
+          set -euo pipefail
+          xcodebuild build -project JARVISHLive.xcodeproj -scheme JARVISHLive -configuration Debug \
+            -destination 'generic/platform=iOS' -derivedDataPath build/device \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO 2>&1 | tee build/evidence/device-build.log
+          ditto -c -k --sequesterRsrc --keepParent build/device/Build/Products/Debug-iphoneos/JARVISHLive.app build/evidence/JARVISHLive-UNSIGNED-NOT-INSTALLABLE.app.zip
+      - name: Run unit and UI tests on iPhone simulator
+        run: |
+          set -euo pipefail
+          xcrun simctl boot "$SIMULATOR_ID"
+          xcrun simctl bootstatus "$SIMULATOR_ID" -b
+          xcodebuild test -project JARVISHLive.xcodeproj -scheme JARVISHLive -configuration Debug \
+            -destination "platform=iOS Simulator,id=$SIMULATOR_ID" -destination-timeout 120 \
+            -derivedDataPath build/simulator -resultBundlePath build/evidence/Tests.xcresult \
+            -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            2>&1 | tee build/evidence/simulator-tests.log
+      - name: Capture launched simulator app
+        run: |
+          set -euo pipefail
+          xcrun simctl launch "$SIMULATOR_ID" org.example.jarvishlive
+          sleep 3
+          xcrun simctl io "$SIMULATOR_ID" screenshot build/evidence/simulator-app.png
+          xcrun xcresulttool get test-results summary --path build/evidence/Tests.xcresult > build/evidence/test-summary.json
+      - name: Preserve logs and test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-evidence-${{ github.run_id }}
+          path: build/evidence/
+          retention-days: 3
+          if-no-files-found: warn
+      - name: State verification boundary
+        if: always()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          This workflow builds unsigned iPhone code and executes simulator XCTest/UI tests.
+          It does not sign or install on a physical iPhone, access the helmet Wi-Fi,
+          confirm Local Network permission behavior, discover the helmet, or play a stream.
+          See job status and uploaded logs for the actual result; this summary is not a pass claim.
+          EOF
